@@ -80,58 +80,10 @@ def save_csv(bucket, key, rows, fieldnames):
     )
 
 
-# Stage IDs that count as "active" for outreach-context purposes:
-# Inquiry, Firm, Matched, Confirm, Hold.
-ACTIVE_DEAL_STAGE_IDS = {2109142, 111800, 2381534, 2388323, 2094373}
-
-# custom_fields.custom_label_1958 is a multi-select; these IDs map to the
-# Buy / Sell labels in the CRM.
-DEAL_TYPE_BUY_ID  = 5077819
-DEAL_TYPE_SELL_ID = 5011675
-
-
-def _extract_deal_type_label(deal):
-    """Read custom_fields.custom_label_1958 and return 'Buy' / 'Sell' / ''.
-    The field is a multi-select so the value can be a list; entries can be
-    bare integers, numeric strings, or {id|value|option_id: ...} dicts."""
-    custom = deal.get("custom_fields")
-    if not isinstance(custom, dict):
-        return ""
-    raw = custom.get("custom_label_1958")
-    if raw is None:
-        return ""
-    items = raw if isinstance(raw, list) else [raw]
-    ids = set()
-    for item in items:
-        if isinstance(item, bool):
-            continue
-        if isinstance(item, int):
-            ids.add(item)
-        elif isinstance(item, str):
-            try:
-                ids.add(int(item.strip()))
-            except ValueError:
-                pass
-        elif isinstance(item, dict):
-            for k in ("id", "value", "option_id"):
-                v = item.get(k)
-                if v is None:
-                    continue
-                try:
-                    ids.add(int(v))
-                    break
-                except (TypeError, ValueError):
-                    pass
-    if DEAL_TYPE_BUY_ID in ids:
-        return "Buy"
-    if DEAL_TYPE_SELL_ID in ids:
-        return "Sell"
-    return ""
-
-
-def load_active_deals_summary():
-    """Load deals_data.json from S3, filter by deal_stage_id, and produce a
-    compact list of "Company | [Industry | ]Buy/Sell" strings. Returns []
+def load_active_companies():
+    """Load deals_data.json from S3 and return a deduped list of company
+    names across ALL deals (no stage filtering). Names beginning with '$'
+    (public-ticker style, e.g. $Uber, $Airbnb) are excluded. Returns []
     if the file is missing or malformed."""
     try:
         s3   = boto3.client("s3")
@@ -140,7 +92,7 @@ def load_active_deals_summary():
     except Exception as e:
         logger.warning(
             f"Could not load deals from s3://{DEALS_BUCKET}/{DEALS_KEY}: {e}; "
-            f"continuing without active_deals_summary"
+            f"continuing without active companies"
         )
         return []
 
@@ -151,54 +103,27 @@ def load_active_deals_summary():
     else:
         deals = []
 
-    summary = []
+    seen = set()
+    companies = []
     for d in deals:
         if not isinstance(d, dict):
             continue
-
-        # Stage filter — direct integer field deal_stage_id.
-        stage_id = d.get("deal_stage_id")
-        try:
-            stage_id = int(stage_id) if stage_id is not None else None
-        except (TypeError, ValueError):
-            stage_id = None
-        if stage_id not in ACTIVE_DEAL_STAGE_IDS:
+        name = d.get("company_name")
+        if not isinstance(name, str):
             continue
-
-        # Company name — direct string field company_name.
-        company = d.get("company_name")
-        company = company.strip() if isinstance(company, str) else ""
-
-        # Deal type — multi-select at custom_fields.custom_label_1958.
-        deal_type = _extract_deal_type_label(d)
-
-        # Industry — best-effort, optional. The schema doesn't have a
-        # confirmed direct field, so try common names and just drop the
-        # segment if nothing turns up.
-        industry = ""
-        for k in ("industry", "company_industry", "sector"):
-            v = d.get(k)
-            if isinstance(v, str) and v.strip():
-                industry = v.strip()
-                break
-
-        if not (company and deal_type):
+        name = name.strip()
+        if not name or name.startswith("$"):
             continue
-        if industry:
-            summary.append(f"{company} | {industry} | {deal_type}")
-        else:
-            summary.append(f"{company} | {deal_type}")
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        companies.append(name)
 
-    # Dedupe while preserving order.
-    seen = set()
-    deduped = []
-    for line in summary:
-        if line not in seen:
-            seen.add(line)
-            deduped.append(line)
-
-    logger.info(f"Active deals summary: {len(deduped)} entries (from {len(deals)} total)")
-    return deduped
+    logger.info(
+        f"Active companies: {len(companies)} unique (from {len(deals)} total deals)"
+    )
+    return companies
 
 
 # ── Web helpers ───────────────────────────────────────────────────────────────
@@ -634,10 +559,14 @@ Respond with plain text. No JSON. No headers. No bullet points. 3-4 sentences.""
 
 # ── Market context (once per invocation) ──────────────────────────────────────
 
-REPUTABLE_OUTLETS = (
-    "wsj.com", "bloomberg.com", "reuters.com", "ft.com",
-    "techcrunch.com", "fortune.com", "forbes.com", "axios.com",
-    "cnbc.com", "businessinsider.com", "pitchbook.com",
+# URL substrings that mark a result as obvious blog / spam / aggregator-noise.
+# These are dropped before anything reaches Bedrock. The list is intentionally
+# narrow — anything not matched here is allowed through, including Google News
+# aggregator results.
+MARKET_CONTEXT_DENY_SUBSTRINGS = (
+    ".blogspot.",
+    ".wordpress.",
+    "medium.com/tag",
 )
 
 MARKET_CONTEXT_MAX_AGE_DAYS = 14
@@ -660,11 +589,12 @@ def _parse_brave_page_age(page_age):
 
 
 def fetch_market_context():
-    """Run a few Brave queries on private/secondary market news; HARD-FILTER
-    by publication date (must be within MARKET_CONTEXT_MAX_AGE_DAYS) before
-    anything is passed to Bedrock. Fetch the top page from a reputable outlet.
-    Returns a dict with snippets + page content; both empty if no fresh
-    reputable result is found."""
+    """Run a few Brave queries on private/secondary market news. Hard-filter
+    by publication date (must be within MARKET_CONTEXT_MAX_AGE_DAYS). Drop
+    obvious blog / spam URLs via MARKET_CONTEXT_DENY_SUBSTRINGS, but accept
+    everything else (including Google News aggregator results). Returns a
+    dict with snippets + page content; both empty if no fresh result
+    survives."""
     queries = [
         "private secondary market 2026",
         "pre-IPO transactions news 2026",
@@ -674,16 +604,16 @@ def fetch_market_context():
     snippets     = []
     page_content = ""
     page_source  = ""
-    dropped_stale     = 0
-    dropped_undated   = 0
-    dropped_low_trust = 0
+    dropped_stale   = 0
+    dropped_undated = 0
+    dropped_blog    = 0
 
     for q in queries:
         results = brave_search(q, count=5)
         for r in results:
             url = (r.get("url") or "").lower()
-            if not any(o in url for o in REPUTABLE_OUTLETS):
-                dropped_low_trust += 1
+            if any(s in url for s in MARKET_CONTEXT_DENY_SUBSTRINGS):
+                dropped_blog += 1
                 continue
             published = _parse_brave_page_age(r.get("page_age", ""))
             if published is None:
@@ -707,11 +637,11 @@ def fetch_market_context():
         f"Market context: kept_snippets={len(snippets)} "
         f"page_content={len(page_content)}c source={page_source or '(none)'} "
         f"dropped_stale={dropped_stale} dropped_undated={dropped_undated} "
-        f"dropped_low_trust={dropped_low_trust}"
+        f"dropped_blog={dropped_blog}"
     )
 
-    # If nothing fresh-and-reputable made it through, return empty so the
-    # middle paragraph is omitted entirely rather than citing stale data.
+    # If nothing fresh made it through, return empty so the middle
+    # paragraph is omitted entirely rather than citing stale data.
     if not snippets and not page_content:
         return {"snippets": "", "page_content": "", "source": ""}
 
@@ -731,7 +661,7 @@ def market_context_text(market_context):
 # ── Email drafting ────────────────────────────────────────────────────────────
 
 def draft_email(row, email_type, angle, research, market_context=None,
-                prior_first_sentences=None, active_deals_summary=None):
+                prior_first_sentences=None, active_companies=None):
     first = row.get("First Name", "").strip()
     last  = row.get("Last Name", "").strip()
     title = row.get("Job Title", "").strip()
@@ -789,19 +719,19 @@ match what Chad offers. The email should:
             )
 
     deals_block = ""
-    if active_deals_summary:
-        deals_lines = "\n".join(f"- {line}" for line in active_deals_summary)
-        deals_block = f"""ACTIVE DEALS — what Chad is currently working on (Company | Industry | Buy/Sell):
+    if active_companies:
+        deals_lines = ", ".join(active_companies)
+        deals_block = f"""COMPANIES Chad currently has deals in:
 {deals_lines}
 
-Given this list and what you know about this prospect's firm, sector, geography,
-and portfolio: identify whether there is a GENUINE specific connection between
-what Chad is offering and what this person does or cares about. If yes, use that
-connection naturally to inform sentence 1 (the specific opener) and the overall
-tone. If no real connection exists, use a different specific non-obvious opener
-instead — DO NOT manufacture a connection that isn't there. NEVER mention any
-specific deal or company from the ACTIVE DEALS list by name in the email body;
-the list is for your reasoning only.
+Given this list and what you know about this prospect's firm, sector,
+geography, and portfolio: identify whether there is a GENUINE specific
+connection between what Chad is offering and what this person does or
+cares about. If yes, use that connection naturally to inform sentence 1
+(the specific opener) and the overall tone. If no real connection exists,
+use a different specific non-obvious opener instead — DO NOT manufacture
+a connection that isn't there. NEVER mention any specific company from
+this list by name in the email body; the list is for your reasoning only.
 """
 
     prompt = f"""Write a cold outreach email from Chad Gracia to {first} {last}, {title} at {firm}.
@@ -1082,7 +1012,7 @@ def lambda_handler(event, context):
 
     # Active deals: load once at startup so each draft can be informed by
     # what Chad is currently active on. Soft-fail to empty list.
-    active_deals_summary = load_active_deals_summary()
+    active_companies = load_active_companies()
 
     # Market context fetched ONCE per invocation; shared across all drafts so
     # the middle paragraph in each email is grounded in the same source material
@@ -1173,7 +1103,7 @@ def lambda_handler(event, context):
                 winner, winner_type, winner_angle, winner_research,
                 market_context=market_context,
                 prior_first_sentences=prior_first_sentences,
-                active_deals_summary=active_deals_summary,
+                active_companies=active_companies,
             )
             if not draft.get("subject") or not draft.get("body"):
                 logger.error(f"Draft generation failed for {winner_email}; skipping")
