@@ -28,6 +28,7 @@ import logging
 import os
 import random
 import re
+import unicodedata
 import urllib.parse
 import urllib.request
 import urllib.error
@@ -144,9 +145,11 @@ def brave_search(query, count=5):
         results = []
         for item in (data.get("web", {}).get("results") or [])[:count]:
             results.append({
-                "title":   item.get("title", ""),
-                "snippet": item.get("description", ""),
-                "url":     item.get("url", ""),
+                "title":    item.get("title", ""),
+                "snippet":  item.get("description", ""),
+                "url":      item.get("url", ""),
+                "page_age": item.get("page_age", ""),  # ISO 8601 if present
+                "age":      item.get("age", ""),       # human-readable e.g. "3 days ago"
             })
         logger.info(f"Brave '{query[:60]}': {len(results)} results")
         return results
@@ -184,9 +187,27 @@ def research_firm(row):
     last   = row.get("Last Name", "").strip()
     firm   = row.get("Firm", "").strip()
 
+    # Use the firm name from the CSV for both Brave queries. Fall back to a
+    # title-cased domain stem only if the Firm column is genuinely empty, and
+    # log it so we can fix the upstream data.
+    if firm:
+        firm_query = firm
+    else:
+        stem = domain.split(".")[0] if domain else ""
+        firm_query = " ".join(p.capitalize() for p in re.split(r"[-_]", stem)) if stem else ""
+        if firm_query:
+            logger.warning(
+                f"Firm column empty for {email!r}; falling back to domain-derived "
+                f"firm_query={firm_query!r}"
+            )
+
     # Brave search for firm. Also a more targeted search to surface portfolio pages.
-    results = brave_search(f'"{domain}" OR "{firm}" family office investments', count=6)
-    portfolio_results = brave_search(f'"{firm}" portfolio OR investments OR companies', count=6)
+    results = brave_search(
+        f'"{firm_query}" "{domain}" family office investments', count=6
+    ) if (firm_query or domain) else []
+    portfolio_results = brave_search(
+        f'"{firm_query}" portfolio OR investments OR companies', count=6
+    ) if firm_query else []
 
     # Fetch homepage
     home_url = f"https://{domain}" if domain else ""
@@ -413,35 +434,81 @@ REPUTABLE_OUTLETS = (
     "cnbc.com", "businessinsider.com", "pitchbook.com",
 )
 
+MARKET_CONTEXT_MAX_AGE_DAYS = 14
+
+
+def _parse_brave_page_age(page_age):
+    """Parse Brave's page_age field (ISO 8601 string) to a UTC datetime.
+    Returns None if unparseable or empty."""
+    if not page_age:
+        return None
+    try:
+        # Brave returns e.g. "2026-04-28T13:45:00" or with trailing "Z" / offset.
+        s = page_age.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(s)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
 
 def fetch_market_context():
-    """Run a few Brave queries on private/secondary market news; fetch the top
-    page from a reputable outlet. Returns a dict with snippets + page content."""
+    """Run a few Brave queries on private/secondary market news; HARD-FILTER
+    by publication date (must be within MARKET_CONTEXT_MAX_AGE_DAYS) before
+    anything is passed to Bedrock. Fetch the top page from a reputable outlet.
+    Returns a dict with snippets + page content; both empty if no fresh
+    reputable result is found."""
     queries = [
         "private secondary market 2026",
         "pre-IPO transactions news 2026",
         "private markets outlook 2026",
     ]
+    cutoff       = datetime.now(timezone.utc) - timedelta(days=MARKET_CONTEXT_MAX_AGE_DAYS)
     snippets     = []
     page_content = ""
     page_source  = ""
+    dropped_stale     = 0
+    dropped_undated   = 0
+    dropped_low_trust = 0
+
     for q in queries:
         results = brave_search(q, count=5)
         for r in results:
             url = (r.get("url") or "").lower()
-            if any(o in url for o in REPUTABLE_OUTLETS):
-                snippets.append(f"- ({q}) {r.get('title','')}: {r.get('snippet','')}")
-                if not page_content:
-                    page_content = fetch_page(r["url"])
-                    page_source  = r["url"]
-                break
-    if snippets or page_content:
-        logger.info(
-            f"Market context: snippets={len(snippets)} "
-            f"page_content={len(page_content)}c source={page_source or '(none)'}"
-        )
-    else:
-        logger.info("Market context: no reputable results found")
+            if not any(o in url for o in REPUTABLE_OUTLETS):
+                dropped_low_trust += 1
+                continue
+            published = _parse_brave_page_age(r.get("page_age", ""))
+            if published is None:
+                # No date → treat as stale; we cannot prove freshness.
+                dropped_undated += 1
+                continue
+            if published < cutoff:
+                dropped_stale += 1
+                continue
+            # Passed filters: include this result.
+            snippets.append(
+                f"- ({q}) [{published.strftime('%Y-%m-%d')}] "
+                f"{r.get('title','')}: {r.get('snippet','')}"
+            )
+            if not page_content:
+                page_content = fetch_page(r["url"])
+                page_source  = r["url"]
+            break
+
+    logger.info(
+        f"Market context: kept_snippets={len(snippets)} "
+        f"page_content={len(page_content)}c source={page_source or '(none)'} "
+        f"dropped_stale={dropped_stale} dropped_undated={dropped_undated} "
+        f"dropped_low_trust={dropped_low_trust}"
+    )
+
+    # If nothing fresh-and-reputable made it through, return empty so the
+    # middle paragraph is omitted entirely rather than citing stale data.
+    if not snippets and not page_content:
+        return {"snippets": "", "page_content": "", "source": ""}
+
     return {
         "snippets":     "\n".join(snippets),
         "page_content": page_content,
@@ -691,12 +758,26 @@ def _strip_signoff_name(body):
 
 # ── SES ───────────────────────────────────────────────────────────────────────
 
+def _ascii_fold(s):
+    """NFKD-normalize then strip non-ASCII so e.g. 'joão' → 'joao', 'é' → 'e'.
+    Used only for safe display in the digest body; original strings are not
+    modified."""
+    if not s:
+        return s
+    return unicodedata.normalize("NFKD", s).encode("ascii", "ignore").decode("ascii")
+
+
 def send_digest(row, email_type, angle, research, draft, research_summary=""):
     ses   = boto3.client("ses", region_name="us-east-1")
     first = row.get("First Name", "")
     last  = row.get("Last Name", "")
     firm  = row.get("Firm", "")
     email = row.get("Email", "")
+
+    # Display-only fold so non-ASCII characters in the prospect email (e.g.
+    # joão@firm.com) don't break SES when interpolated into the digest body.
+    # The actual SES Destination is CHAD_EMAIL, never the prospect's address.
+    email_display = _ascii_fold(email)
 
     summary_text = (research_summary or "").strip() or "(no summary generated)"
 
@@ -706,7 +787,7 @@ PROSPECT
   Name:       {first} {last}
   Title:      {row.get('Job Title', '')}
   Firm:       {firm}
-  Email:      {email}
+  Email:      {email_display}
   Type:       {email_type}
   Why:        {angle}
 
@@ -716,13 +797,13 @@ RESEARCH SUMMARY
 {'=' * 50}
 DRAFT EMAIL
 
-{email}
+{email_display}
 {draft.get('subject', '(none)')}
 
 {draft.get('body', '(no body)')}
 {'=' * 50}
 
-To update: email agent@ with "mark {email} as responded" or "mark {email} as skip"
+To update: email agent@ with "mark {email_display} as responded" or "mark {email_display} as skip"
 """
 
     ses.send_email(
