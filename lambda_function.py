@@ -80,6 +80,115 @@ def save_csv(bucket, key, rows, fieldnames):
     )
 
 
+# Stage IDs that count as "active" for outreach-context purposes:
+# Inquiry, Firm, Matched, Confirm, Hold.
+ACTIVE_DEAL_STAGE_IDS = {2109142, 111800, 2381534, 2388323, 2094373}
+
+
+def _coerce_stage_id(deal):
+    """Pull a stage id off a deal record regardless of how it's nested.
+    Returns int or None."""
+    candidates = [
+        deal.get("stage_id"),
+        deal.get("stageId"),
+        deal.get("stage"),
+        (deal.get("stage") or {}).get("id") if isinstance(deal.get("stage"), dict) else None,
+        (deal.get("pipeline_stage") or {}).get("id") if isinstance(deal.get("pipeline_stage"), dict) else None,
+    ]
+    for v in candidates:
+        if v is None:
+            continue
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def _coerce_str(value):
+    """Pull a string out of a possibly-nested {name: ...} structure."""
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value.strip()
+    if isinstance(value, dict):
+        for k in ("name", "title", "label", "value"):
+            v = value.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return ""
+
+
+def load_active_deals_summary():
+    """Load deals_data.json from S3, filter to ACTIVE_DEAL_STAGE_IDS, and
+    produce a compact list of "Company | Industry | Buy/Sell" strings.
+    Returns [] if the file is missing or malformed."""
+    try:
+        s3   = boto3.client("s3")
+        obj  = s3.get_object(Bucket=DEALS_BUCKET, Key=DEALS_KEY)
+        data = json.loads(obj["Body"].read().decode("utf-8", errors="ignore"))
+    except Exception as e:
+        logger.warning(
+            f"Could not load deals from s3://{DEALS_BUCKET}/{DEALS_KEY}: {e}; "
+            f"continuing without active_deals_summary"
+        )
+        return []
+
+    if isinstance(data, list):
+        deals = data
+    elif isinstance(data, dict):
+        deals = data.get("deals") or data.get("data") or data.get("results") or []
+    else:
+        deals = []
+
+    summary = []
+    for d in deals:
+        if not isinstance(d, dict):
+            continue
+        stage_id = _coerce_stage_id(d)
+        if stage_id not in ACTIVE_DEAL_STAGE_IDS:
+            continue
+
+        company = (
+            _coerce_str(d.get("company_name"))
+            or _coerce_str(d.get("company"))
+            or _coerce_str(d.get("issuer"))
+        )
+        industry = (
+            _coerce_str(d.get("industry"))
+            or _coerce_str(d.get("company_industry"))
+            or _coerce_str(d.get("sector"))
+            or _coerce_str((d.get("company") or {}).get("industry") if isinstance(d.get("company"), dict) else None)
+        )
+        deal_type_raw = (
+            _coerce_str(d.get("deal_type"))
+            or _coerce_str(d.get("type"))
+            or _coerce_str(d.get("side"))
+            or _coerce_str(d.get("direction"))
+        ).lower()
+        if deal_type_raw in {"buy", "buyer", "buy-side", "buyside", "bid"}:
+            deal_type = "Buy"
+        elif deal_type_raw in {"sell", "seller", "sell-side", "sellside", "ask", "offer"}:
+            deal_type = "Sell"
+        else:
+            deal_type = ""
+
+        if not (company and industry and deal_type):
+            continue
+        summary.append(f"{company} | {industry} | {deal_type}")
+
+    # Dedupe while preserving order.
+    seen = set()
+    deduped = []
+    for line in summary:
+        if line not in seen:
+            seen.add(line)
+            deduped.append(line)
+
+    logger.info(f"Active deals summary: {len(deduped)} entries (from {len(deals)} total)")
+    return deduped
+
+
 # ── Web helpers ───────────────────────────────────────────────────────────────
 
 NAV_TERMS = {
@@ -610,7 +719,7 @@ def market_context_text(market_context):
 # ── Email drafting ────────────────────────────────────────────────────────────
 
 def draft_email(row, email_type, angle, research, market_context=None,
-                prior_first_sentences=None):
+                prior_first_sentences=None, active_deals_summary=None):
     first = row.get("First Name", "").strip()
     last  = row.get("Last Name", "").strip()
     title = row.get("Job Title", "").strip()
@@ -667,6 +776,22 @@ match what Chad offers. The email should:
                 f"be materially different from all of these):\n{joined}\n"
             )
 
+    deals_block = ""
+    if active_deals_summary:
+        deals_lines = "\n".join(f"- {line}" for line in active_deals_summary)
+        deals_block = f"""ACTIVE DEALS — what Chad is currently working on (Company | Industry | Buy/Sell):
+{deals_lines}
+
+Given this list and what you know about this prospect's firm, sector, geography,
+and portfolio: identify whether there is a GENUINE specific connection between
+what Chad is offering and what this person does or cares about. If yes, use that
+connection naturally to inform sentence 1 (the specific opener) and the overall
+tone. If no real connection exists, use a different specific non-obvious opener
+instead — DO NOT manufacture a connection that isn't there. NEVER mention any
+specific deal or company from the ACTIVE DEALS list by name in the email body;
+the list is for your reasoning only.
+"""
+
     prompt = f"""Write a cold outreach email from Chad Gracia to {first} {last}, {title} at {firm}.
 
 WHAT CHAD DOES: He specializes in secondary transactions in pre-IPO private tech companies like
@@ -684,7 +809,7 @@ PORTFOLIO EVIDENCE (specific holdings; one detail here is fair game for sentence
 
 {market_block}
 
-{prior_block}EMAIL TYPE INSTRUCTIONS:
+{deals_block}{prior_block}EMAIL TYPE INSTRUCTIONS:
 {type_instruction}
 
 EMAIL STRUCTURE — produce exactly this, in order:
@@ -698,11 +823,14 @@ EMAIL STRUCTURE — produce exactly this, in order:
 
 Sentence 1: Open with something specific and non-obvious about THIS person or
             firm — drawn from their background, firm origin story, a specific
-            portfolio company, or an unusual credential. It must NOT be a
-            generic "given your focus on X" opener. It must NOT be flattering
-            or fawning. Sound like Chad noticed something real. No two emails
-            in this run may open the same way (see ALREADY-USED list above if
-            present).
+            portfolio company, an unusual credential, OR (if a genuine
+            connection exists per the ACTIVE DEALS reasoning above) the
+            sector / company-type overlap with what Chad is currently
+            working on. It must NOT be a generic "given your focus on X"
+            opener. It must NOT be flattering or fawning. NEVER name a
+            specific deal from the ACTIVE DEALS list. Sound like Chad
+            noticed something real. No two emails in this run may open the
+            same way (see ALREADY-USED list above if present).
 
 Sentence 2: Rewritten fresh each time, but the structure is locked. State that Chad
             specializes in secondary transactions in private companies and name at
@@ -940,6 +1068,10 @@ def lambda_handler(event, context):
     rows, fieldnames = load_csv(OUTREACH_BUCKET, OUTREACH_KEY)
     logger.info(f"Queue: {len(rows)} rows")
 
+    # Active deals: load once at startup so each draft can be informed by
+    # what Chad is currently active on. Soft-fail to empty list.
+    active_deals_summary = load_active_deals_summary()
+
     # Market context fetched ONCE per invocation; shared across all drafts so
     # the middle paragraph in each email is grounded in the same source material
     # but framed differently.
@@ -1029,6 +1161,7 @@ def lambda_handler(event, context):
                 winner, winner_type, winner_angle, winner_research,
                 market_context=market_context,
                 prior_first_sentences=prior_first_sentences,
+                active_deals_summary=active_deals_summary,
             )
             if not draft.get("subject") or not draft.get("body"):
                 logger.error(f"Draft generation failed for {winner_email}; skipping")
