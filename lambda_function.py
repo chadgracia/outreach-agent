@@ -81,6 +81,15 @@ def save_csv(bucket, key, rows, fieldnames):
 
 # ── Web helpers ───────────────────────────────────────────────────────────────
 
+NAV_TERMS = {
+    "about", "team", "portfolio", "contact", "menu", "home",
+    "services", "resources", "careers", "blog", "news",
+    "login", "log in", "sign in", "sign up", "subscribe",
+    "investments", "holdings", "companies", "people",
+    "search", "press", "media", "events",
+}
+
+
 def fetch_page(url, max_chars=3000):
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
@@ -92,7 +101,27 @@ def fetch_page(url, max_chars=3000):
                          flags=re.DOTALL | re.IGNORECASE)
         cleaned = re.sub(r"<style\b[^>]*>.*?</style>", " ", cleaned,
                          flags=re.DOTALL | re.IGNORECASE)
+        # Insert newlines at block boundaries so we can filter nav noise per line.
+        cleaned = re.sub(
+            r"</?(p|div|li|ul|ol|nav|header|footer|section|article|h[1-6]|tr|td|br)\b[^>]*>",
+            "\n", cleaned, flags=re.IGNORECASE,
+        )
         text = re.sub(r"<[^>]+>", " ", cleaned)
+        kept = []
+        for line in text.split("\n"):
+            line = re.sub(r"[ \t]+", " ", line).strip()
+            if not line:
+                continue
+            words = line.split()
+            if len(words) < 6:
+                low = line.lower().rstrip(".,;:!?")
+                if low in NAV_TERMS:
+                    continue
+                # All-capitalized short lines (e.g. "About Us Team Portfolio") look like nav.
+                if all(w[:1].isupper() for w in words if w):
+                    continue
+            kept.append(line)
+        text = " ".join(kept)
         text = re.sub(r"\s+", " ", text).strip()
         return text[:max_chars]
     except Exception as e:
@@ -126,12 +155,17 @@ def brave_search(query, count=5):
         return []
 
 
-def best_url_from_results(domain, results):
+PORTFOLIO_KEYWORDS = ["portfolio", "investments", "companies", "holdings"]
+USEFUL_KEYWORDS    = PORTFOLIO_KEYWORDS + [
+    "about", "invest", "focus", "strategy", "approach", "team", "what-we-do"
+]
+
+
+def best_url_from_results(domain, results, keywords=None):
     """Pick the most informative URL Brave found for this domain."""
-    USEFUL = ["about", "invest", "portfolio", "focus", "strategy",
-              "approach", "companies", "holdings", "team", "what-we-do"]
+    keywords = keywords if keywords is not None else USEFUL_KEYWORDS
     # Prefer pages from their own domain with useful keywords
-    for kw in USEFUL:
+    for kw in keywords:
         for r in results:
             u = r.get("url", "").lower()
             if domain in u and kw in u:
@@ -150,30 +184,44 @@ def research_firm(row):
     last   = row.get("Last Name", "").strip()
     firm   = row.get("Firm", "").strip()
 
-    # Brave search for firm
+    # Brave search for firm. Also a more targeted search to surface portfolio pages.
     results = brave_search(f'"{domain}" OR "{firm}" family office investments', count=6)
+    portfolio_results = brave_search(f'"{firm}" portfolio OR investments OR companies', count=6)
 
     # Fetch homepage
-    homepage = fetch_page(f"https://{domain}") if domain else ""
+    home_url = f"https://{domain}" if domain else ""
+    homepage = fetch_page(home_url) if domain else ""
 
     # Fetch best secondary page if different from homepage
-    best_url      = best_url_from_results(domain, results)
-    secondary     = fetch_page(best_url) if best_url and best_url != f"https://{domain}" else ""
+    best_url   = best_url_from_results(domain, results)
+    secondary  = fetch_page(best_url) if best_url and best_url != home_url else ""
 
-    snippets = "\n".join(f"- {r['title']}: {r['snippet']}" for r in results)
+    # Fetch a dedicated portfolio/investments/companies/holdings page if we can find one
+    # that is distinct from homepage and secondary.
+    portfolio_url = best_url_from_results(
+        domain, results + portfolio_results, keywords=PORTFOLIO_KEYWORDS
+    )
+    if portfolio_url and portfolio_url not in {home_url, best_url}:
+        portfolio_content = fetch_page(portfolio_url)
+    else:
+        portfolio_content = ""
+
+    snippets = "\n".join(f"- {r['title']}: {r['snippet']}" for r in (results + portfolio_results))
 
     # Combine: prefer secondary page, fall back to homepage, fall back to snippets
     web_content = secondary or homepage or snippets
 
     logger.info(
         f"Research {first} {last} @ {domain}: "
-        f"homepage={len(homepage)}c, secondary={len(secondary)}c, snippets={len(snippets)}c"
+        f"homepage={len(homepage)}c, secondary={len(secondary)}c, "
+        f"portfolio={len(portfolio_content)}c, snippets={len(snippets)}c"
     )
     return {
-        "web_content": web_content,
-        "snippets":    snippets,
-        "domain":      domain,
-        "firm":        firm,
+        "web_content":       web_content,
+        "portfolio_content": portfolio_content,
+        "snippets":          snippets,
+        "domain":            domain,
+        "firm":              firm,
     }
 
 
@@ -217,49 +265,64 @@ def evaluate_candidates(candidates, research_list):
     """
     profiles = ""
     for i, (row, res) in enumerate(zip(candidates, research_list)):
-        context = (res["web_content"] or res["snippets"] or "No content found.")[:600]
+        about_text     = (res.get("web_content") or res.get("snippets") or "No content found.")[:600]
+        portfolio_text = (res.get("portfolio_content") or "")[:600] or "(no portfolio page found)"
         profiles += f"""
 --- Candidate {i} ---
-Name:    {row.get('First Name','')} {row.get('Last Name','')}
-Title:   {row.get('Job Title','')}
-Firm:    {res['firm']} ({res['domain']})
-Content: {context}
+Name:      {row.get('First Name','')} {row.get('Last Name','')}
+Title:     {row.get('Job Title','')}
+Firm:      {res['firm']} ({res['domain']})
+About/web: {about_text}
+Portfolio: {portfolio_text}
 """
 
-    prompt = f"""You are evaluating prospects for a broker who sells pre-IPO secondary shares 
+    prompt = f"""You are evaluating prospects for a broker who sells pre-IPO secondary shares
 in private tech companies (Anthropic, SpaceX, Anduril, xAI, etc.) — direct investments only, no SPVs or funds.
 
 Evaluate each candidate and assign ONE of these types:
 
   firm_fit
     The firm itself is a family office that invests passively in private tech/growth companies.
-    They don't need board seats or control. Signals: growth equity, tech, innovation, alternatives, 
-    private markets, venture exposure mentioned. Staff at these firms (VP, Associate, analyst) also 
+    They don't need board seats or control. Signals: growth equity, tech, innovation, alternatives,
+    private markets, venture exposure mentioned. Staff at these firms (VP, Associate, analyst) also
     get firm_fit — they are legitimate contacts for deal flow even if not the decision maker.
 
-  owner_opportunistic  
-    The firm is a family office but the mandate doesn't match (e.g. control PE, real estate, 
-    mid-market buyouts, or unclear). However, this specific person is a FOUNDER, OWNER, CEO, 
-    or PRINCIPAL whose own money is being managed. Even if the firm doesn't buy minority tech 
+  owner_opportunistic
+    The firm is a family office but the mandate doesn't match (e.g. control PE, real estate,
+    mid-market buyouts, or unclear). However, this specific person is a FOUNDER, OWNER, CEO,
+    or PRINCIPAL whose own money is being managed. Even if the firm doesn't buy minority tech
     stakes, they personally might invest $100K-$1M in Anthropic or SpaceX opportunistically.
     Use this type for senior principals at ANY family office regardless of mandate.
 
   hold
-    The entity is a VC fund, wealth advisor managing third-party capital, bank, pension fund, 
+    The entity is a VC fund, wealth advisor managing third-party capital, bank, pension fund,
     endowment, or large institution. Not relevant now but not worth burning.
 
   skip
-    Definitively not relevant: real estate only, infrastructure debt, non-investor (law firm, 
+    Definitively not relevant: real estate only, infrastructure debt, non-investor (law firm,
     accountant, service provider), or no signals of investment activity at all.
 
-Key reasoning rules:
-- Family offices rarely publish their holdings. Infer mandate from: firm description, sector 
-  language, deal types mentioned, investment philosophy, geography.
-- A control PE firm owner = owner_opportunistic (not skip)
-- A real estate firm owner = skip (real estate is the business, not a family office wrapper)
-- Junior staff (Analyst, Associate) at a family office = firm_fit if the firm qualifies
-- Junior staff at a non-qualifying firm = hold or skip depending on firm type
-- When in doubt between hold and skip, choose hold
+EVIDENCE RULES — read carefully:
+- Look at ACTUAL investment examples on the Portfolio section, not just mandate language
+  from the about page. "Private equity" / "growth equity" wording on its own is NOT enough
+  to justify firm_fit if the visible portfolio doesn't back it up.
+- If portfolio companies are visible and are clearly NON-tech (local businesses,
+  middle-market industrial, real estate, consumer services, regional manufacturing,
+  laundromats, restaurants, dealerships, etc.), DOWNGRADE accordingly:
+    * The PERSON is a founder/owner/CEO/principal at the firm → owner_opportunistic
+    * The PERSON is just an employee/staff → hold
+- A real-estate-only firm owner = skip (real estate is the business, not a family office wrapper).
+- A control-PE firm owner = owner_opportunistic (not skip).
+- Junior staff (Analyst, Associate) at a firm whose ACTUAL portfolio is tech/growth = firm_fit.
+- Junior staff at a non-qualifying firm = hold (or skip if the firm is clearly out of scope).
+- When in doubt between hold and skip, choose hold.
+
+The "angle" field MUST contain three things, separated by " | ":
+  (a) What the firm actually invests in based on portfolio evidence (one phrase, concrete).
+  (b) The specific angle most likely to get a response from THIS person.
+  (c) One non-obvious biographical or firm detail worth Chad knowing — unusual background,
+      career path, firm origin story, surprising portfolio company, etc. If nothing
+      non-obvious is visible in the research, write "no notable detail in research".
 
 Candidates:
 {profiles}
@@ -270,11 +333,15 @@ Respond ONLY with valid JSON:
     {{
       "index": 0,
       "type": "firm_fit|owner_opportunistic|hold|skip",
-      "angle": "<one sentence — what specifically makes them fit or why they are hold/skip>"
+      "angle": "<(a) actual investments | (b) angle for this person | (c) non-obvious detail>"
     }},
     ...
   ]
-}}"""
+}}
+
+UNIQUENESS NOTE: when later drafting outreach emails for the qualifying candidates,
+no two emails in this run may share the same opening phrase, sentence structure, or
+framing. Vary the angle materially across candidates."""
 
     result = bedrock_json(prompt, max_tokens=700)
     evaluations = result.get("evaluations", [])
@@ -288,21 +355,122 @@ Respond ONLY with valid JSON:
     return evaluations, qualifying
 
 
+# ── Strategic research summary ────────────────────────────────────────────────
+
+def summarize_research(row, research, angle, market_context_text=""):
+    """Bedrock-generated 3-4 sentence strategic summary used in the digest header."""
+    first = row.get("First Name", "").strip()
+    last  = row.get("Last Name", "").strip()
+    title = row.get("Job Title", "").strip()
+    firm  = research.get("firm", "")
+
+    about_text     = (research.get("web_content") or research.get("snippets") or "")[:1200]
+    portfolio_text = (research.get("portfolio_content") or "")[:1200]
+
+    prompt = f"""Summarize the firm and the prospect for Chad's awareness in 3-4 sentences max.
+Do NOT write an email. Do NOT pitch. Strategic notes only.
+
+Cover:
+  1. What the firm ACTUALLY does, based on evidence (especially portfolio companies),
+     not their self-description.
+  2. The specific angle most likely to get a response from this person.
+  3. One non-obvious detail worth knowing — biographical, portfolio, origin story.
+     If nothing non-obvious is visible, say so plainly; do not invent.
+
+If market_context is provided and any item in it is directly relevant to this firm,
+you may reference it in one phrase. Otherwise ignore it.
+
+PROSPECT
+  Name:  {first} {last}
+  Title: {title}
+  Firm:  {firm}
+
+PRIOR ANGLE NOTES (may be incomplete):
+{angle}
+
+ABOUT / WEB:
+{about_text or '(none)'}
+
+PORTFOLIO:
+{portfolio_text or '(none)'}
+
+MARKET CONTEXT (optional):
+{(market_context_text or '')[:600] or '(none)'}
+
+Respond with plain text. No JSON. No headers. No bullet points. 3-4 sentences."""
+    try:
+        return bedrock_call(prompt, max_tokens=350).strip()
+    except Exception as e:
+        logger.warning(f"summarize_research failed for {first} {last}: {e}")
+        return ""
+
+
+# ── Market context (once per invocation) ──────────────────────────────────────
+
+REPUTABLE_OUTLETS = (
+    "wsj.com", "bloomberg.com", "reuters.com", "ft.com",
+    "techcrunch.com", "fortune.com", "forbes.com", "axios.com",
+    "cnbc.com", "businessinsider.com", "pitchbook.com",
+)
+
+
+def fetch_market_context():
+    """Run a few Brave queries on private/secondary market news; fetch the top
+    page from a reputable outlet. Returns a dict with snippets + page content."""
+    queries = [
+        "private secondary market 2026",
+        "pre-IPO transactions news 2026",
+        "private markets outlook 2026",
+    ]
+    snippets     = []
+    page_content = ""
+    page_source  = ""
+    for q in queries:
+        results = brave_search(q, count=5)
+        for r in results:
+            url = (r.get("url") or "").lower()
+            if any(o in url for o in REPUTABLE_OUTLETS):
+                snippets.append(f"- ({q}) {r.get('title','')}: {r.get('snippet','')}")
+                if not page_content:
+                    page_content = fetch_page(r["url"])
+                    page_source  = r["url"]
+                break
+    if snippets or page_content:
+        logger.info(
+            f"Market context: snippets={len(snippets)} "
+            f"page_content={len(page_content)}c source={page_source or '(none)'}"
+        )
+    else:
+        logger.info("Market context: no reputable results found")
+    return {
+        "snippets":     "\n".join(snippets),
+        "page_content": page_content,
+        "source":       page_source,
+    }
+
+
+def market_context_text(market_context):
+    if not market_context:
+        return ""
+    return (market_context.get("page_content") or market_context.get("snippets") or "").strip()
+
+
 # ── Email drafting ────────────────────────────────────────────────────────────
 
-def draft_email(row, email_type, angle, research):
+def draft_email(row, email_type, angle, research, market_context=None,
+                prior_first_sentences=None):
     first = row.get("First Name", "").strip()
     last  = row.get("Last Name", "").strip()
     title = row.get("Job Title", "").strip()
     firm  = row.get("Firm", "").strip()
 
     if email_type == "owner_opportunistic":
-        type_instruction = f"""This person runs a family office whose mandate does not directly 
+        type_instruction = f"""This person runs a family office whose mandate does not directly
 match what Chad offers. The email should:
 - Explicitly acknowledge that the firm's focus isn't aligned with what Chad does
 - Pivot to a personal, opportunistic angle — they likely have personal capital outside the firm mandate
 - Be brief and direct — no need to over-explain
-- Example tone: "I know {firm} is focused on [their thing], so this probably isn't relevant 
+- Example tone: "I know {firm} is focused on [their thing], so this probably isn't relevant
   institutionally, but thought you might find it interesting on a personal basis."
 """
     else:
@@ -311,6 +479,41 @@ match what Chad offers. The email should:
 - Position Chad's offering as relevant to their existing approach
 - Example tone: "Given your focus on growth equity, wanted to put myself on your radar."
 """
+
+    market_text = market_context_text(market_context)
+    if market_text:
+        market_block = (
+            "MARKET CONTEXT (raw research; ground the middle paragraph in this — "
+            "no invented facts, specific dollar figures and company names from "
+            "respected sources are fine):\n"
+            f"{market_text[:1200]}"
+        )
+        market_paragraph_instruction = (
+            "Middle paragraph: 2-3 sentences grounded in the MARKET CONTEXT above, "
+            "connecting current pre-IPO/secondary market conditions to why Chad is "
+            "reaching out NOW. This paragraph MUST vary in angle and framing across "
+            "the 5 drafts in this run — same source material, different emphasis "
+            "each time. No invented facts. If a figure or company name from the "
+            "context is relevant, use it; do NOT make one up."
+        )
+    else:
+        market_block = "MARKET CONTEXT: (none — omit the middle paragraph entirely)"
+        market_paragraph_instruction = (
+            "Middle paragraph: OMIT entirely. No market paragraph this run. "
+            "Go straight from sentence 2 to sentence 3."
+        )
+
+    portfolio_text = (research.get("portfolio_content") or "")[:400]
+    research_text  = (research.get("web_content") or research.get("snippets") or "")[:500]
+
+    prior_block = ""
+    if prior_first_sentences:
+        joined = "\n".join(f"- {s}" for s in prior_first_sentences if s)
+        if joined:
+            prior_block = (
+                "ALREADY-USED OPENING SENTENCES IN THIS RUN (your sentence 1 must "
+                f"be materially different from all of these):\n{joined}\n"
+            )
 
     prompt = f"""Write a cold outreach email from Chad Gracia to {first} {last}, {title} at {firm}.
 
@@ -322,17 +525,33 @@ WHY THIS PERSON (use to inform tone only, do NOT quote back):
 {angle}
 
 FIRM RESEARCH (use to inform tone only, do NOT quote back):
-{(research['web_content'] or research['snippets'])[:500]}
+{research_text}
 
-EMAIL TYPE INSTRUCTIONS:
+PORTFOLIO EVIDENCE (specific holdings; one detail here is fair game for sentence 1):
+{portfolio_text or '(none)'}
+
+{market_block}
+
+{prior_block}EMAIL TYPE INSTRUCTIONS:
 {type_instruction}
 
-WRITE EXACTLY 3 SENTENCES plus a salutation and a sign-off. Nothing more.
+EMAIL STRUCTURE — produce exactly this, in order:
+  Dear {first},
+  <blank line>
+  <Sentence 1: specific opener>
+  <Sentence 2: what Chad does, locked structure>
+  <Market context paragraph: 2-3 sentences, varied — OR omit if no context>
+  <Sentence 3: soft close with link>
+  Sincerely,
 
-Salutation: "Dear {first}," on its own line, followed by a blank line. The
-            salutation is separate from the 3 sentences and is NOT counted
-            as one of them.
-Sentence 1: Natural context-setter. Brief. Human.
+Sentence 1: Open with something specific and non-obvious about THIS person or
+            firm — drawn from their background, firm origin story, a specific
+            portfolio company, or an unusual credential. It must NOT be a
+            generic "given your focus on X" opener. It must NOT be flattering
+            or fawning. Sound like Chad noticed something real. No two emails
+            in this run may open the same way (see ALREADY-USED list above if
+            present).
+
 Sentence 2: Rewritten fresh each time, but the structure is locked. State that Chad
             specializes in secondary transactions in private companies and name at
             least these six companies: Anthropic, SpaceX, Anduril, AMI Labs,
@@ -344,9 +563,13 @@ Sentence 2: Rewritten fresh each time, but the structure is locked. State that C
             it gets crowded", no "alpha", no "deal flow", no "proprietary", no
             "curated", no "exclusive access", no "unique opportunity", no
             "space" used as a noun (e.g. "the private markets space").
+
+Market paragraph: {market_paragraph_instruction}
+
 Sentence 3: Soft close that MUST contain the full URL {MAIN_URL} verbatim. Do not paraphrase it,
             do not shorten it, do not drop the trailing slash, do not wrap it in markdown.
             The literal string {MAIN_URL} must appear in this sentence as written.
+
 Sign-off:   The literal text "Sincerely," on its own line. Do NOT write any
             name after it. Do NOT write "Chad", "Chad Gracia", or any other
             name anywhere in the body. The recipient pastes their own
@@ -361,14 +584,15 @@ HARD RULES — violation means rejected:
 - Do NOT mention Rainmaker Securities in the body
 - Do NOT say "FINRA broker"
 - Sound like a smart human wrote it quickly, not a marketing department
+- Vary vocabulary, sentence length, and angle vs. any prior emails in this run
 
 Respond ONLY with valid JSON:
 {{
   "subject": "<short subject, not salesy>",
-  "body": "<salutation, blank line, 3 sentences, sign-off; plain text; newlines as \\n>"
+  "body": "<salutation, blank line, sentence 1, sentence 2, optional market paragraph, sentence 3, sign-off; plain text; newlines as \\n>"
 }}"""
 
-    draft = bedrock_json(prompt, max_tokens=400)
+    draft = bedrock_json(prompt, max_tokens=600)
     body  = draft.get("body", "") or ""
 
     if MAIN_URL not in body:
@@ -381,7 +605,7 @@ Respond ONLY with valid JSON:
             f"{MAIN_URL} in the body. Rewrite the email and include {MAIN_URL} verbatim in "
             f"sentence 3."
         )
-        draft = bedrock_json(retry_prompt, max_tokens=400)
+        draft = bedrock_json(retry_prompt, max_tokens=600)
         body  = draft.get("body", "") or ""
 
         if MAIN_URL not in body:
@@ -391,8 +615,45 @@ Respond ONLY with valid JSON:
             )
             body = _append_url_before_signoff(body, MAIN_URL)
 
+    # First-sentence dedup: if the opener matches a prior winner's opener, regenerate once.
+    fs = _first_sentence(body)
+    if fs and prior_first_sentences and any(
+        _normalize_sentence(fs) == _normalize_sentence(p) for p in prior_first_sentences if p
+    ):
+        logger.warning(
+            f"Draft for {first} {last} duplicates a prior opening sentence; regenerating"
+        )
+        dedup_prompt = (
+            prompt
+            + "\n\nIMPORTANT: Your previous sentence 1 was nearly identical to one "
+            "already used in this run. Rewrite the whole email with a materially "
+            "different sentence 1 — different angle, different opening words, "
+            "different structure."
+        )
+        draft = bedrock_json(dedup_prompt, max_tokens=600)
+        body  = draft.get("body", "") or ""
+        if MAIN_URL not in body:
+            body = _append_url_before_signoff(body, MAIN_URL)
+
     draft["body"] = _strip_signoff_name(body)
     return draft
+
+
+def _first_sentence(body):
+    """Extract the first sentence after the salutation."""
+    if not body:
+        return ""
+    for line in body.split("\n"):
+        s = line.strip()
+        if not s or s.lower().startswith("dear"):
+            continue
+        m = re.match(r"(.+?[.!?])(\s|$)", s)
+        return (m.group(1) if m else s).strip()
+    return ""
+
+
+def _normalize_sentence(s):
+    return re.sub(r"\s+", " ", re.sub(r"[^a-z0-9 ]+", " ", s.lower())).strip()
 
 
 def _append_url_before_signoff(body, url):
@@ -430,25 +691,14 @@ def _strip_signoff_name(body):
 
 # ── SES ───────────────────────────────────────────────────────────────────────
 
-def send_digest(row, email_type, angle, research, draft):
+def send_digest(row, email_type, angle, research, draft, research_summary=""):
     ses   = boto3.client("ses", region_name="us-east-1")
     first = row.get("First Name", "")
     last  = row.get("Last Name", "")
     firm  = row.get("Firm", "")
     email = row.get("Email", "")
 
-    page_content = research.get('web_content', '') or ''
-    snippets     = research.get('snippets', '') or ''
-    code_markers = ('function(', 'window.', 'document.', '{"@')
-    if page_content and any(m in page_content for m in code_markers):
-        research_label = "SEARCH SNIPPETS"
-        research_text  = snippets or "(no clean content available)"
-    elif page_content:
-        research_label = "PAGE CONTENT"
-        research_text  = page_content
-    else:
-        research_label = "SEARCH SNIPPETS"
-        research_text  = snippets or "(no content found)"
+    summary_text = (research_summary or "").strip() or "(no summary generated)"
 
     body = f"""OUTREACH DRAFT — {datetime.now(timezone.utc).strftime('%Y-%m-%d')}
 
@@ -460,8 +710,8 @@ PROSPECT
   Type:       {email_type}
   Why:        {angle}
 
-{research_label}
-{research_text[:600]}
+RESEARCH SUMMARY
+{summary_text}
 
 {'=' * 50}
 DRAFT EMAIL
@@ -524,12 +774,18 @@ def lambda_handler(event, context):
     rows, fieldnames = load_csv(OUTREACH_BUCKET, OUTREACH_KEY)
     logger.info(f"Queue: {len(rows)} rows")
 
+    # Market context fetched ONCE per invocation; shared across all drafts so
+    # the middle paragraph in each email is grounded in the same source material
+    # but framed differently.
+    market_context = fetch_market_context()
+
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    winners_sent  = []
-    all_held      = []
-    all_skipped   = []
-    locked_in_run = set()   # firm domains already used by a winner this invocation
-    seen_emails   = set()   # candidates already evaluated this invocation
+    winners_sent          = []
+    all_held              = []
+    all_skipped           = []
+    locked_in_run         = set()   # firm domains already used by a winner this invocation
+    seen_emails           = set()   # candidates already evaluated this invocation
+    prior_first_sentences = []      # for cross-draft uniqueness checks
 
     for batch_num in range(MAX_BATCHES):
         if len(winners_sent) >= TARGET_WINNERS:
@@ -598,18 +854,34 @@ def lambda_handler(event, context):
                 )
                 continue
 
-            draft = draft_email(winner, winner_type, winner_angle, winner_research)
+            research_summary = summarize_research(
+                winner, winner_research, winner_angle,
+                market_context_text=market_context_text(market_context),
+            )
+
+            draft = draft_email(
+                winner, winner_type, winner_angle, winner_research,
+                market_context=market_context,
+                prior_first_sentences=prior_first_sentences,
+            )
             if not draft.get("subject") or not draft.get("body"):
                 logger.error(f"Draft generation failed for {winner_email}; skipping")
                 continue
 
-            send_digest(winner, winner_type, winner_angle, winner_research, draft)
+            send_digest(
+                winner, winner_type, winner_angle, winner_research, draft,
+                research_summary=research_summary,
+            )
 
             for row in rows:
                 if row.get("Email", "").strip().lower() == winner_email:
                     row["Status"]    = "sent"
                     row["Date Sent"] = today_str
                     break
+
+            fs = _first_sentence(draft.get("body", ""))
+            if fs:
+                prior_first_sentences.append(fs)
 
             if winner_domain:
                 locked_in_run.add(winner_domain)
