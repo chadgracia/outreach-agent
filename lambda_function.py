@@ -83,7 +83,13 @@ def fetch_page(url, max_chars=3000):
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
         with urllib.request.urlopen(req, timeout=3) as resp:
             raw  = resp.read().decode("utf-8", errors="ignore")
-        text = re.sub(r"<[^>]+>", " ", raw)
+        # Drop <script> and <style> blocks (and their contents) before
+        # stripping HTML tags, so we don't leak JS or JSON-LD into research.
+        cleaned = re.sub(r"<script\b[^>]*>.*?</script>", " ", raw,
+                         flags=re.DOTALL | re.IGNORECASE)
+        cleaned = re.sub(r"<style\b[^>]*>.*?</style>", " ", cleaned,
+                         flags=re.DOTALL | re.IGNORECASE)
+        text = re.sub(r"<[^>]+>", " ", cleaned)
         text = re.sub(r"\s+", " ", text).strip()
         return text[:max_chars]
     except Exception as e:
@@ -318,8 +324,11 @@ FIRM RESEARCH (use to inform tone only, do NOT quote back):
 EMAIL TYPE INSTRUCTIONS:
 {type_instruction}
 
-WRITE EXACTLY 3 SENTENCES plus a sign-off. Nothing more.
+WRITE EXACTLY 3 SENTENCES plus a salutation and a sign-off. Nothing more.
 
+Salutation: "Dear {first}," on its own line, followed by a blank line. The
+            salutation is separate from the 3 sentences and is NOT counted
+            as one of them.
 Sentence 1: Natural context-setter. Brief. Human.
 Sentence 2: Rewritten fresh each time, but the structure is locked. State that Chad
             specializes in secondary transactions in private companies and name at
@@ -333,7 +342,10 @@ Sentence 2: Rewritten fresh each time, but the structure is locked. State that C
             "curated", no "exclusive access", no "unique opportunity", no
             "space" used as a noun (e.g. "the private markets space").
 Sentence 3: Soft close with trading page link.
-Sign-off: Sincerely,
+Sign-off:   The literal text "Sincerely," on its own line. Do NOT write any
+            name after it. Do NOT write "Chad", "Chad Gracia", or any other
+            name anywhere in the body. The recipient pastes their own
+            signature manually.
 
 HARD RULES — violation means rejected:
 - NO dashes of any kind used as punctuation (no em-dash, no en-dash, no " - " between clauses)
@@ -348,10 +360,31 @@ HARD RULES — violation means rejected:
 Respond ONLY with valid JSON:
 {{
   "subject": "<short subject, not salesy>",
-  "body": "<3 sentences plus sign-off, plain text, newlines as \\n>"
+  "body": "<salutation, blank line, 3 sentences, sign-off; plain text; newlines as \\n>"
 }}"""
 
-    return bedrock_json(prompt, max_tokens=400)
+    draft = bedrock_json(prompt, max_tokens=400)
+    draft["body"] = _strip_signoff_name(draft.get("body", "") or "")
+    return draft
+
+
+def _strip_signoff_name(body):
+    """Remove any 'Chad Gracia' (or bare 'Chad') line that follows 'Sincerely,'.
+    Defensive cleanup in case the model appends a name despite instructions."""
+    if not body:
+        return body
+    cleaned = re.sub(r"\bChad\s+Gracia\b", "", body)
+    lines = cleaned.split("\n")
+    out = []
+    prev_was_signoff = False
+    for line in lines:
+        stripped = line.strip()
+        if prev_was_signoff and stripped.lower() in {"chad", "chad,", "chad gracia"}:
+            prev_was_signoff = False
+            continue
+        out.append(line)
+        prev_was_signoff = stripped.lower().startswith("sincerely")
+    return "\n".join(out).rstrip() + "\n"
 
 
 # ── SES ───────────────────────────────────────────────────────────────────────
@@ -363,6 +396,19 @@ def send_digest(row, email_type, angle, research, draft):
     firm  = row.get("Firm", "")
     email = row.get("Email", "")
 
+    page_content = research.get('web_content', '') or ''
+    snippets     = research.get('snippets', '') or ''
+    code_markers = ('function(', 'window.', 'document.', '{"@')
+    if page_content and any(m in page_content for m in code_markers):
+        research_label = "SEARCH SNIPPETS"
+        research_text  = snippets or "(no clean content available)"
+    elif page_content:
+        research_label = "PAGE CONTENT"
+        research_text  = page_content
+    else:
+        research_label = "SEARCH SNIPPETS"
+        research_text  = snippets or "(no content found)"
+
     body = f"""OUTREACH DRAFT — {datetime.now(timezone.utc).strftime('%Y-%m-%d')}
 
 PROSPECT
@@ -373,8 +419,8 @@ PROSPECT
   Type:       {email_type}
   Why:        {angle}
 
-RESEARCH
-{(research['web_content'] or research['snippets'])[:600]}
+{research_label}
+{research_text[:600]}
 
 {'=' * 50}
 DRAFT EMAIL
