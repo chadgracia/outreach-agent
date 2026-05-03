@@ -180,34 +180,119 @@ def best_url_from_results(domain, results, keywords=None):
     return None
 
 
+# Words/tokens that look like firm names but are almost always navigation / generic.
+_FIRM_NAME_BLACKLIST = {
+    "about", "about us", "home", "contact", "contact us", "team", "our team",
+    "menu", "log in", "sign in", "sign up", "privacy policy", "terms of service",
+    "family office", "private equity", "wealth management", "asset management",
+    "investment management", "the team", "our firm",
+}
+
+# Strip trailing legal entity suffixes when they appear at the end of an extracted
+# phrase (so e.g. "Hall Capital LLC" becomes "Hall Capital"). Note: "Group" and
+# "Holdings" are intentionally NOT included — they're more often part of the
+# canonical firm name (e.g. Casimir Holdings, Carlyle Group).
+_LEGAL_SUFFIX_RE = re.compile(
+    r"\s+(LLC|L\.L\.C\.?|Inc\.?|Incorporated|Ltd\.?|Limited|LP|L\.P\.?|"
+    r"LLP|Co\.?|Corp\.?|Corporation)$",
+    re.IGNORECASE,
+)
+
+# Two-to-five capitalized tokens in a row, allowing acronyms and ampersands.
+_FIRM_NAME_RE = re.compile(r"\b([A-Z][A-Za-z&]*(?:\s+[A-Z][A-Za-z&]*){1,4})\b")
+
+
+def _extract_firm_name(results, domain):
+    """Pick the most-common capitalized multi-word phrase appearing in titles
+    and snippets that overlaps with the domain stem. Returns "" if nothing
+    plausible is found."""
+    if not results or not domain:
+        return ""
+    domain_stem = re.sub(r"[^a-z]", "", domain.split(".")[0].lower())
+    if not domain_stem:
+        return ""
+
+    scores = {}
+    for r in results:
+        text = f"{r.get('title','')} . {r.get('snippet','')}"
+        for phrase in _FIRM_NAME_RE.findall(text):
+            phrase = phrase.strip()
+            low    = phrase.lower()
+            if low in _FIRM_NAME_BLACKLIST:
+                continue
+            words = phrase.split()
+            if len(words) < 2 or len(words) > 5:
+                continue
+            phrase_letters = re.sub(r"[^a-z]", "", low)
+            if not phrase_letters:
+                continue
+            # Strong signal: domain stem is a substring of the phrase letters.
+            if domain_stem in phrase_letters or phrase_letters in domain_stem:
+                weight = 5
+            elif domain_stem[:4] and domain_stem[:4] in phrase_letters:
+                weight = 2
+            else:
+                continue  # phrase doesn't look related to this domain
+            scores[phrase] = scores.get(phrase, 0) + weight
+
+    if not scores:
+        return ""
+
+    # Highest weighted-frequency wins; ties broken by shorter phrase
+    # (longer phrases tend to include legal suffixes / extra noise).
+    best = max(scores.items(), key=lambda kv: (kv[1], -len(kv[0])))[0]
+    cleaned = _LEGAL_SUFFIX_RE.sub("", best).strip()
+    return cleaned or best
+
+
 def research_firm(row):
     email  = row.get("Email", "").strip()
     domain = email.split("@")[-1].lower() if "@" in email else ""
     first  = row.get("First Name", "").strip()
     last   = row.get("Last Name", "").strip()
-    firm   = row.get("Firm", "").strip()
+    firm_raw = row.get("Firm", "").strip()
 
-    # Use the firm name from the CSV for both Brave queries. Fall back to a
-    # title-cased domain stem only if the Firm column is genuinely empty, and
-    # log it so we can fix the upstream data.
-    if firm:
-        firm_query = firm
+    # Initial firm name: use the CSV value if any, else a title-cased domain stem.
+    if firm_raw:
+        initial_firm_query = firm_raw
     else:
         stem = domain.split(".")[0] if domain else ""
-        firm_query = " ".join(p.capitalize() for p in re.split(r"[-_]", stem)) if stem else ""
-        if firm_query:
+        initial_firm_query = " ".join(p.capitalize() for p in re.split(r"[-_]", stem)) if stem else ""
+        if initial_firm_query:
             logger.warning(
-                f"Firm column empty for {email!r}; falling back to domain-derived "
-                f"firm_query={firm_query!r}"
+                f"Firm column empty for {email!r}; bootstrapping with domain-derived "
+                f"firm_query={initial_firm_query!r}"
             )
 
-    # Brave search for firm. Also a more targeted search to surface portfolio pages.
+    # Initial primary search — also serves as snippet source for firm-name extraction.
     results = brave_search(
-        f'"{firm_query}" "{domain}" family office investments', count=6
-    ) if (firm_query or domain) else []
+        f'"{initial_firm_query}" "{domain}" family office investments', count=6
+    ) if (initial_firm_query or domain) else []
+
+    # Extract a cleaner firm name from the snippets we just got.
+    extracted = _extract_firm_name(results, domain)
+    firm_query = extracted or initial_firm_query
+
+    if extracted and extracted.lower() != initial_firm_query.lower():
+        logger.info(
+            f"Firm name resolved from snippets: csv={firm_raw!r} "
+            f"extracted={extracted!r} (was using {initial_firm_query!r}) for {domain}"
+        )
+        # Re-run primary search with the cleaned name so downstream content
+        # is anchored on the canonical firm name, not the malformed CSV value.
+        fresh = brave_search(
+            f'"{firm_query}" "{domain}" family office investments', count=6
+        )
+        if fresh:
+            results = fresh
+
+    # Portfolio search uses the cleaned firm name.
     portfolio_results = brave_search(
         f'"{firm_query}" portfolio OR investments OR companies', count=6
     ) if firm_query else []
+
+    # Use the cleaned firm name everywhere downstream (display, Bedrock prompts).
+    firm = firm_query or firm_raw
 
     # Fetch homepage
     home_url = f"https://{domain}" if domain else ""
