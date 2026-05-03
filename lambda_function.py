@@ -5,9 +5,11 @@ Flow:
   1. Pick 5 random pending (respecting 7-day firm lockout)
   2. Research all 5 in parallel — fetch firm website via Brave-found URLs
   3. Bedrock evaluates each and assigns: firm_fit | owner_opportunistic | staff_fit | hold | skip
-  4. Pick best winner (firm_fit > staff_fit > owner_opportunistic)
-  5. Draft email matched to type
-  6. Send digest to Chad, update statuses in S3, loop to next batch if no winner
+  4. Take all qualifying in priority order (firm_fit > staff_fit > owner_opportunistic),
+     skipping any whose firm domain was already used by an earlier winner in this run
+  5. Draft email matched to type (with verbatim trading URL enforcement)
+  6. Send one digest per winner to Chad, update statuses in S3, loop until TARGET_WINNERS
+     winners have been emailed or qualifying candidates run out
 
 Email types:
   firm_fit / staff_fit  — pitch the institution, reference their mandate
@@ -44,11 +46,12 @@ DEALS_KEY         = "deals_data.json"
 SES_SENDER        = "agent@agent.graciagroup.com"
 CHAD_EMAIL        = "cgracia@rainmakersecurities.com"
 BEDROCK_MODEL     = "us.anthropic.claude-sonnet-4-6"
-MAIN_URL          = "https://trades.graciagroup.com"
+MAIN_URL          = "https://trades.graciagroup.com/"
 BRAVE_API_KEY     = os.environ.get("BRAVE_API_KEY", "")
 FIRM_LOCKOUT_DAYS = 7
 BATCH_SIZE        = 5
-MAX_BATCHES       = 5
+TARGET_WINNERS    = 5
+MAX_BATCHES       = 15
 
 # Priority order for winner selection
 TYPE_PRIORITY = {"firm_fit": 0, "staff_fit": 1, "owner_opportunistic": 2}
@@ -305,8 +308,8 @@ match what Chad offers. The email should:
 
     prompt = f"""Write a cold outreach email from Chad Gracia to {first} {last}, {title} at {firm}.
 
-WHAT CHAD DOES: He specializes in secondary transactions in pre-IPO private tech companies like 
-Anthropic, SpaceX, Anduril and xAI. He also sometimes has early access to seed rounds before 
+WHAT CHAD DOES: He specializes in secondary transactions in pre-IPO private tech companies like
+Anthropic, SpaceX, Anduril and xAI. He also sometimes has early access to seed rounds before
 they become well known. Trading page: {MAIN_URL}
 
 WHY THIS PERSON (use to inform tone only, do NOT quote back):
@@ -322,7 +325,9 @@ WRITE EXACTLY 3 SENTENCES plus a sign-off. Nothing more.
 
 Sentence 1: Natural context-setter. Brief. Human.
 Sentence 2: What Chad does, one sentence, intriguing not salesy.
-Sentence 3: Soft close with trading page link.
+Sentence 3: Soft close that MUST contain the full URL {MAIN_URL} verbatim. Do not paraphrase it,
+            do not shorten it, do not drop the trailing slash, do not wrap it in markdown.
+            The literal string {MAIN_URL} must appear in this sentence as written.
 Sign-off: Chad Gracia
 
 HARD RULES — violation means rejected:
@@ -341,7 +346,43 @@ Respond ONLY with valid JSON:
   "body": "<3 sentences plus sign-off, plain text, newlines as \\n>"
 }}"""
 
-    return bedrock_json(prompt, max_tokens=400)
+    draft = bedrock_json(prompt, max_tokens=400)
+    body  = draft.get("body", "") or ""
+
+    if MAIN_URL not in body:
+        logger.warning(
+            f"Draft for {first} {last} missing URL {MAIN_URL!r} on first try; redrafting"
+        )
+        retry_prompt = (
+            prompt
+            + f"\n\nIMPORTANT: Your previous attempt did not include the literal string "
+            f"{MAIN_URL} in the body. Rewrite the email and include {MAIN_URL} verbatim in "
+            f"sentence 3."
+        )
+        draft = bedrock_json(retry_prompt, max_tokens=400)
+        body  = draft.get("body", "") or ""
+
+        if MAIN_URL not in body:
+            logger.warning(
+                f"Draft for {first} {last} still missing URL {MAIN_URL!r} after retry; "
+                f"appending manually before sign-off"
+            )
+            draft["body"] = _append_url_before_signoff(body, MAIN_URL)
+
+    return draft
+
+
+def _append_url_before_signoff(body, url):
+    """Insert the URL on its own line before the sign-off line."""
+    lines = body.split("\n")
+    signoff_idx = None
+    for i in range(len(lines) - 1, -1, -1):
+        if lines[i].strip() and "chad" in lines[i].lower():
+            signoff_idx = i
+            break
+    if signoff_idx is None:
+        return body.rstrip() + "\n\n" + url
+    return "\n".join(lines[:signoff_idx] + [url, ""] + lines[signoff_idx:])
 
 
 # ── SES ───────────────────────────────────────────────────────────────────────
@@ -391,7 +432,8 @@ To update: email agent@ with "mark {email} as responded" or "mark {email} as ski
 
 # ── Candidate selection ───────────────────────────────────────────────────────
 
-def select_candidates(rows):
+def select_candidates(rows, exclude_emails=None):
+    exclude_emails = exclude_emails or set()
     today  = datetime.now(timezone.utc).date()
     cutoff = today - timedelta(days=FIRM_LOCKOUT_DAYS)
 
@@ -408,8 +450,9 @@ def select_candidates(rows):
         r for r in rows
         if r.get("Status", "").strip() == "pending"
         and r.get("Email", "").split("@")[-1].lower() not in locked
+        and r.get("Email", "").strip().lower() not in exclude_emails
     ]
-    logger.info(f"Pending: {len(pending)} | Locked domains: {len(locked)}")
+    logger.info(f"Pending: {len(pending)} | Locked domains: {len(locked)} | Excluded: {len(exclude_emails)}")
     if not pending:
         return []
     return random.sample(pending, min(BATCH_SIZE, len(pending)))
@@ -426,15 +469,24 @@ def lambda_handler(event, context):
     logger.info(f"Queue: {len(rows)} rows")
 
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    winner = winner_type = winner_angle = winner_research = None
-    all_held    = []
-    all_skipped = []
+    winners_sent  = []
+    all_held      = []
+    all_skipped   = []
+    locked_in_run = set()   # firm domains already used by a winner this invocation
+    seen_emails   = set()   # candidates already evaluated this invocation
 
     for batch_num in range(MAX_BATCHES):
-        candidates = select_candidates(rows)
+        if len(winners_sent) >= TARGET_WINNERS:
+            logger.info(f"Reached target of {TARGET_WINNERS} winners")
+            break
+
+        candidates = select_candidates(rows, exclude_emails=seen_emails)
         if not candidates:
             logger.info("No more pending candidates")
             break
+
+        for c in candidates:
+            seen_emails.add(c.get("Email", "").strip().lower())
 
         logger.info(f"Batch {batch_num + 1}: {[r.get('Email') for r in candidates]}")
 
@@ -450,7 +502,7 @@ def lambda_handler(event, context):
 
         # Apply hold/skip statuses immediately
         for ev in evaluations:
-            i    = ev.get("index", -1)
+            i     = ev.get("index", -1)
             etype = ev.get("type", "")
             if not (0 <= i < len(candidates)):
                 continue
@@ -470,26 +522,61 @@ def lambda_handler(event, context):
                         row["Date Sent"] = today_str
                         break
 
-        # Pick winner from qualifying (already sorted by priority)
-        if qualifying:
-            best   = qualifying[0]
-            idx    = best["index"]
-            winner         = candidates[idx]
-            winner_type    = best["type"]
-            winner_angle   = best["angle"]
+        # Process qualifying in priority order, enforcing in-run firm lockout
+        for q in qualifying:
+            if len(winners_sent) >= TARGET_WINNERS:
+                break
+
+            idx           = q["index"]
+            winner        = candidates[idx]
+            winner_type   = q["type"]
+            winner_angle  = q["angle"]
             winner_research = research_list[idx]
+            winner_email  = winner.get("Email", "").strip().lower()
+            winner_domain = winner_email.split("@")[-1] if "@" in winner_email else ""
+
+            if winner_domain and winner_domain in locked_in_run:
+                logger.info(
+                    f"Skipping {winner_email}: firm domain {winner_domain} "
+                    f"already used by a winner this run"
+                )
+                continue
+
+            draft = draft_email(winner, winner_type, winner_angle, winner_research)
+            if not draft.get("subject") or not draft.get("body"):
+                logger.error(f"Draft generation failed for {winner_email}; skipping")
+                continue
+
+            send_digest(winner, winner_type, winner_angle, winner_research, draft)
+
+            for row in rows:
+                if row.get("Email", "").strip().lower() == winner_email:
+                    row["Status"]    = "sent"
+                    row["Date Sent"] = today_str
+                    break
+
+            if winner_domain:
+                locked_in_run.add(winner_domain)
+            winners_sent.append({
+                "prospect": f"{winner.get('First Name')} {winner.get('Last Name')} <{winner_email}>",
+                "type":     winner_type,
+                "angle":    winner_angle,
+            })
             logger.info(
-                f"Winner batch {batch_num + 1}: "
-                f"{winner.get('First Name')} {winner.get('Last Name')} "
-                f"type={winner_type}"
+                f"Winner #{len(winners_sent)} batch {batch_num + 1}: "
+                f"{winner.get('First Name')} {winner.get('Last Name')} type={winner_type}"
             )
-            break
 
-        logger.info(f"Batch {batch_num + 1}: no winner. held={len(all_held)} skipped={len(all_skipped)}")
+        # Persist after every batch so partial progress survives a crash
         save_csv(OUTREACH_BUCKET, OUTREACH_KEY, rows, fieldnames)
+        logger.info(
+            f"Batch {batch_num + 1} done. winners_sent={len(winners_sent)} "
+            f"held={len(all_held)} skipped={len(all_skipped)}"
+        )
 
-    if not winner:
-        save_csv(OUTREACH_BUCKET, OUTREACH_KEY, rows, fieldnames)
+    save_csv(OUTREACH_BUCKET, OUTREACH_KEY, rows, fieldnames)
+
+    if not winners_sent:
         logger.info("No qualifying prospect found.")
         return {
             "statusCode": 200,
@@ -498,31 +585,11 @@ def lambda_handler(event, context):
             "skipped":    all_skipped,
         }
 
-    # Draft email
-    draft = draft_email(winner, winner_type, winner_angle, winner_research)
-    if not draft.get("subject") or not draft.get("body"):
-        logger.error("Draft generation failed")
-        return {"statusCode": 500, "error": "Draft generation failed"}
-
-    # Send to Chad
-    send_digest(winner, winner_type, winner_angle, winner_research, draft)
-
-    # Mark winner as sent
-    winner_email = winner.get("Email", "").strip().lower()
-    for row in rows:
-        if row.get("Email", "").strip().lower() == winner_email:
-            row["Status"]    = "sent"
-            row["Date Sent"] = today_str
-            break
-
-    save_csv(OUTREACH_BUCKET, OUTREACH_KEY, rows, fieldnames)
-    logger.info(f"Marked {winner_email} as sent. held={len(all_held)} skipped={len(all_skipped)}")
-
     return {
-        "statusCode":  200,
-        "prospect":    f"{winner.get('First Name')} {winner.get('Last Name')} <{winner_email}>",
-        "type":        winner_type,
-        "angle":       winner_angle,
-        "held":        all_held,
-        "skipped":     all_skipped,
+        "statusCode":     200,
+        "winners_sent":   len(winners_sent),
+        "target":         TARGET_WINNERS,
+        "prospects":      winners_sent,
+        "held":           all_held,
+        "skipped":        all_skipped,
     }
