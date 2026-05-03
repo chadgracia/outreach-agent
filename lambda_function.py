@@ -84,45 +84,55 @@ def save_csv(bucket, key, rows, fieldnames):
 # Inquiry, Firm, Matched, Confirm, Hold.
 ACTIVE_DEAL_STAGE_IDS = {2109142, 111800, 2381534, 2388323, 2094373}
 
-
-def _coerce_stage_id(deal):
-    """Pull a stage id off a deal record regardless of how it's nested.
-    Returns int or None."""
-    candidates = [
-        deal.get("stage_id"),
-        deal.get("stageId"),
-        deal.get("stage"),
-        (deal.get("stage") or {}).get("id") if isinstance(deal.get("stage"), dict) else None,
-        (deal.get("pipeline_stage") or {}).get("id") if isinstance(deal.get("pipeline_stage"), dict) else None,
-    ]
-    for v in candidates:
-        if v is None:
-            continue
-        try:
-            return int(v)
-        except (TypeError, ValueError):
-            continue
-    return None
+# custom_fields.custom_label_1958 is a multi-select; these IDs map to the
+# Buy / Sell labels in the CRM.
+DEAL_TYPE_BUY_ID  = 5077819
+DEAL_TYPE_SELL_ID = 5011675
 
 
-def _coerce_str(value):
-    """Pull a string out of a possibly-nested {name: ...} structure."""
-    if value is None:
+def _extract_deal_type_label(deal):
+    """Read custom_fields.custom_label_1958 and return 'Buy' / 'Sell' / ''.
+    The field is a multi-select so the value can be a list; entries can be
+    bare integers, numeric strings, or {id|value|option_id: ...} dicts."""
+    custom = deal.get("custom_fields")
+    if not isinstance(custom, dict):
         return ""
-    if isinstance(value, str):
-        return value.strip()
-    if isinstance(value, dict):
-        for k in ("name", "title", "label", "value"):
-            v = value.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
+    raw = custom.get("custom_label_1958")
+    if raw is None:
+        return ""
+    items = raw if isinstance(raw, list) else [raw]
+    ids = set()
+    for item in items:
+        if isinstance(item, bool):
+            continue
+        if isinstance(item, int):
+            ids.add(item)
+        elif isinstance(item, str):
+            try:
+                ids.add(int(item.strip()))
+            except ValueError:
+                pass
+        elif isinstance(item, dict):
+            for k in ("id", "value", "option_id"):
+                v = item.get(k)
+                if v is None:
+                    continue
+                try:
+                    ids.add(int(v))
+                    break
+                except (TypeError, ValueError):
+                    pass
+    if DEAL_TYPE_BUY_ID in ids:
+        return "Buy"
+    if DEAL_TYPE_SELL_ID in ids:
+        return "Sell"
     return ""
 
 
 def load_active_deals_summary():
-    """Load deals_data.json from S3, filter to ACTIVE_DEAL_STAGE_IDS, and
-    produce a compact list of "Company | Industry | Buy/Sell" strings.
-    Returns [] if the file is missing or malformed."""
+    """Load deals_data.json from S3, filter by deal_stage_id, and produce a
+    compact list of "Company | [Industry | ]Buy/Sell" strings. Returns []
+    if the file is missing or malformed."""
     try:
         s3   = boto3.client("s3")
         obj  = s3.get_object(Bucket=DEALS_BUCKET, Key=DEALS_KEY)
@@ -145,37 +155,39 @@ def load_active_deals_summary():
     for d in deals:
         if not isinstance(d, dict):
             continue
-        stage_id = _coerce_stage_id(d)
+
+        # Stage filter — direct integer field deal_stage_id.
+        stage_id = d.get("deal_stage_id")
+        try:
+            stage_id = int(stage_id) if stage_id is not None else None
+        except (TypeError, ValueError):
+            stage_id = None
         if stage_id not in ACTIVE_DEAL_STAGE_IDS:
             continue
 
-        company = (
-            _coerce_str(d.get("company_name"))
-            or _coerce_str(d.get("company"))
-            or _coerce_str(d.get("issuer"))
-        )
-        industry = (
-            _coerce_str(d.get("industry"))
-            or _coerce_str(d.get("company_industry"))
-            or _coerce_str(d.get("sector"))
-            or _coerce_str((d.get("company") or {}).get("industry") if isinstance(d.get("company"), dict) else None)
-        )
-        deal_type_raw = (
-            _coerce_str(d.get("deal_type"))
-            or _coerce_str(d.get("type"))
-            or _coerce_str(d.get("side"))
-            or _coerce_str(d.get("direction"))
-        ).lower()
-        if deal_type_raw in {"buy", "buyer", "buy-side", "buyside", "bid"}:
-            deal_type = "Buy"
-        elif deal_type_raw in {"sell", "seller", "sell-side", "sellside", "ask", "offer"}:
-            deal_type = "Sell"
-        else:
-            deal_type = ""
+        # Company name — direct string field company_name.
+        company = d.get("company_name")
+        company = company.strip() if isinstance(company, str) else ""
 
-        if not (company and industry and deal_type):
+        # Deal type — multi-select at custom_fields.custom_label_1958.
+        deal_type = _extract_deal_type_label(d)
+
+        # Industry — best-effort, optional. The schema doesn't have a
+        # confirmed direct field, so try common names and just drop the
+        # segment if nothing turns up.
+        industry = ""
+        for k in ("industry", "company_industry", "sector"):
+            v = d.get(k)
+            if isinstance(v, str) and v.strip():
+                industry = v.strip()
+                break
+
+        if not (company and deal_type):
             continue
-        summary.append(f"{company} | {industry} | {deal_type}")
+        if industry:
+            summary.append(f"{company} | {industry} | {deal_type}")
+        else:
+            summary.append(f"{company} | {deal_type}")
 
     # Dedupe while preserving order.
     seen = set()
