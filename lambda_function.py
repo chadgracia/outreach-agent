@@ -321,9 +321,19 @@ EMAIL TYPE INSTRUCTIONS:
 WRITE EXACTLY 3 SENTENCES plus a sign-off. Nothing more.
 
 Sentence 1: Natural context-setter. Brief. Human.
-Sentence 2: What Chad does, one sentence, intriguing not salesy.
+Sentence 2: Rewritten fresh each time, but the structure is locked. State that Chad
+            specializes in secondary transactions in private companies and name at
+            least these six companies: Anthropic, SpaceX, Anduril, AMI Labs,
+            Project Prometheus, and Hark Labs. Also weave in that he sometimes has
+            access to primary rounds and data rooms. Sound like a confident human
+            wrote it quickly, not like a pitch deck. Vary the order and phrasing
+            of the company names across emails so they don't all sound identical.
+            Hard rules for THIS sentence: no "before it gets noisy", no "before
+            it gets crowded", no "alpha", no "deal flow", no "proprietary", no
+            "curated", no "exclusive access", no "unique opportunity", no
+            "space" used as a noun (e.g. "the private markets space").
 Sentence 3: Soft close with trading page link.
-Sign-off: Chad Gracia
+Sign-off: Sincerely,
 
 HARD RULES — violation means rejected:
 - NO dashes of any kind used as punctuation (no em-dash, no en-dash, no " - " between clauses)
@@ -369,8 +379,8 @@ RESEARCH
 {'=' * 50}
 DRAFT EMAIL
 
-To: {email}
-Subject: {draft.get('subject', '(none)')}
+{email}
+{draft.get('subject', '(none)')}
 
 {draft.get('body', '(no body)')}
 {'=' * 50}
