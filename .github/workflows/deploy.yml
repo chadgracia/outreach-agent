@@ -16,4 +16,4 @@ jobs:
           aws-region: us-east-1
       - run: |
           zip -j function.zip lambda_function.py
-          aws lambda update-function-code --function-name CRMDealDetails --zip-file fileb://function.zip
+          aws lambda update-function-code --function-name outreach-agent --zip-file fileb://function.zip
