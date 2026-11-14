@@ -13,6 +13,12 @@ Checks:
      (`> /dev/null`, `--query`, or `--output text`). Lambda API responses include
      ALL environment variables, and Actions logs on public repos are public.
   C. Workflows must not dump the environment (printenv, env, set -x).
+  D. os.environ.get / os.getenv must not carry a non-empty string-literal default for a
+     variable whose name contains KEY, SECRET, TOKEN or PASSWORD (a "fallback" value is
+     a hardcoded secret). Use "" and fail soft instead.
+
+CI runs --tree on every push and pull request, so a secret already in the tree fails
+the build even when the change being pushed did not touch it.
 
 Exit 0 = clean, exit 2 = blocked (Claude Code treats exit 2 as "stop and fix").
 A line can be allowed on purpose by adding the comment:  secret-guard: allow
@@ -40,6 +46,13 @@ BENIGN_VALUE = re.compile(
     r"|^https?://"                       # URLs are checked by the "Key in URL" rule instead
     r"|\.(json|txt|csv|html|py|yml)$"    # file / S3 object names
     r"|^(?i:your|example|placeholder|changeme|xxx|dummy|test|fake)")
+# D: environ.get / getenv called with a sensitive NAME and a non-empty literal default
+#    (positional, default=..., or a trailing `or "<literal>"`) -> flagged.
+ENV_DEFAULT = re.compile(
+    r"""(?:os\.environ\.get|os\.getenv)\(\s*(?P<q>["'])(?P<name>[^"']+)(?P=q)\s*"""
+    r"""(?:,\s*(?:default\s*=\s*)?[rbuRBU]?(?P<dq>["'])(?P<dval>[^"']*)(?P=dq)"""
+    r"""|\)\s*or\s*[rbuRBU]?(?P<oq>["'])(?P<oval>[^"']*)(?P=oq))""")
+SENSITIVE_NAME = re.compile(r"(?i)KEY|SECRET|TOKEN|PASSWORD")
 SAFE_LINE = re.compile(r"os\.environ|getenv|process\.env|secrets\.|\$\{\{|secret-guard: allow")
 SKIP_FILES = re.compile(r"(^|/)(package-lock\.json|.*\.lock|.*\.min\.js|.*\.svg|.*\.png|.*\.jpg|.*\.pdf)$")
 LAMBDA_CALL = re.compile(r"\baws\s+lambda\s+")
@@ -51,10 +64,22 @@ def sh(*args):
     return subprocess.run(args, capture_output=True, text=True).stdout
 
 
+def env_default_hits(text):
+    """Names of sensitive env vars given a non-empty literal default in `text`."""
+    out = []
+    for m in ENV_DEFAULT.finditer(text):
+        val = m.group("dval") if m.group("dq") else m.group("oval")
+        if val and SENSITIVE_NAME.search(m.group("name")):
+            out.append(m.group("name"))
+    return out
+
+
 def scan_line(path, line):
-    if SKIP_FILES.search(path) or SAFE_LINE.search(line):
+    if SKIP_FILES.search(path) or "secret-guard: allow" in line:
         return []
-    hits = []
+    hits = ["Hardcoded default for env var " + n for n in env_default_hits(line)]
+    if SAFE_LINE.search(line):
+        return hits
     for name, pat in SECRET_PATTERNS:
         m = pat.search(line)
         if not m:
@@ -148,11 +173,19 @@ def main():
             if SKIP_FILES.search(path) or not os.path.isfile(path):
                 continue
             try:
-                for line in open(path, encoding="utf-8", errors="strict"):
-                    for name in scan_line(path, line):
-                        findings.append((path, name, line))
+                text = open(path, encoding="utf-8", errors="strict").read()
             except (UnicodeDecodeError, OSError):
                 continue
+            line_hits = set()
+            for line in text.splitlines():
+                for name in scan_line(path, line):
+                    line_hits.add(name)
+                    findings.append((path, name, line))
+            # D again on the whole file, so a call split across lines is caught too
+            for n in env_default_hits(text):
+                name = "Hardcoded default for env var " + n
+                if name not in line_hits:
+                    findings.append((path, name, ""))
         return report(findings, check_workflows())
     print(__doc__)
     return 0
